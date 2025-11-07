@@ -296,6 +296,15 @@ static inline void node_free(rope_node_t *node) {
 }
 
 /* ============================================================================
+ * FORWARD DECLARATIONS
+ * ========================================================================= */
+
+static size_t node_byte_len(const rope_node_t *node);
+static size_t node_char_len(const rope_node_t *node);
+static size_t node_newline_count(const rope_node_t *node);
+static void node_update_weights(rope_node_t *node);
+
+/* ============================================================================
  * NODE CONSTRUCTION
  * ========================================================================= */
 
