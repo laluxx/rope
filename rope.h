@@ -338,8 +338,8 @@ static rope_node_t *node_new_branch(rope_node_t *left, rope_node_t *right) {
     node->branch.right = right;
     
     /* Weight = left subtree metrics */
-    node->byte_weight = left->is_leaf ? left->byte_weight : 
-                        left->byte_weight + (left->branch.right ? 
+    node->byte_weight = left->is_leaf ? left->byte_weight :
+                        left->byte_weight + (left->branch.right ?
                         node_byte_len(left->branch.right) : 0);
     node->char_weight = left->is_leaf ? left->char_weight :
                         left->char_weight + (left->branch.right ?
@@ -414,8 +414,11 @@ static inline void node_set_color(rope_node_t *node, rb_color_t color) {
     if (node) node->color = color;
 }
 
-/* Left rotation */
 static rope_node_t *rotate_left(rope_node_t *node) {
+    if (!node || !node->branch.right || node->is_leaf || node->branch.right->is_leaf) {
+        return node;  // Can't rotate leaves or invalid nodes
+    }
+    
     rope_node_t *right = node->branch.right;
     node->branch.right = right->branch.left;
     right->branch.left = node;
@@ -429,8 +432,11 @@ static rope_node_t *rotate_left(rope_node_t *node) {
     return right;
 }
 
-/* Right rotation */
 static rope_node_t *rotate_right(rope_node_t *node) {
+    if (!node || !node->branch.left || node->is_leaf || node->branch.left->is_leaf) {
+        return node;  // Can't rotate leaves or invalid nodes
+    }
+    
     rope_node_t *left = node->branch.left;
     node->branch.left = left->branch.right;
     left->branch.right = node;
@@ -444,26 +450,31 @@ static rope_node_t *rotate_right(rope_node_t *node) {
     return left;
 }
 
-/* Flip colors */
 static void flip_colors(rope_node_t *node) {
     node->color = RB_RED;
     node_set_color(node->branch.left, RB_BLACK);
     node_set_color(node->branch.right, RB_BLACK);
 }
 
-/* Balance node (maintain Red-Black invariants) */
+/* Balance node (maintain Red-Black invariants) - FIXED */
 static rope_node_t *balance(rope_node_t *node) {
     if (!node || node->is_leaf) return node;
     
+    /* Only perform rotations if both children are branch nodes */
+    bool left_is_branch = node->branch.left && !node->branch.left->is_leaf;
+    bool right_is_branch = node->branch.right && !node->branch.right->is_leaf;
+    
     /* Fix right-leaning red */
     if (node_color(node->branch.right) == RB_RED && 
-        node_color(node->branch.left) == RB_BLACK) {
+        node_color(node->branch.left) == RB_BLACK &&
+        right_is_branch) {
         node = rotate_left(node);
     }
     
     /* Fix double red on left */
     if (node_color(node->branch.left) == RB_RED &&
-        node->branch.left && !node->branch.left->is_leaf &&
+        left_is_branch &&
+        node->branch.left->branch.left &&
         node_color(node->branch.left->branch.left) == RB_RED) {
         node = rotate_right(node);
     }
@@ -555,7 +566,30 @@ size_t rope_char_to_byte(const rope_t *rope, size_t char_pos) {
     return byte_offset;
 }
 
-/* Convert byte position to character position */
+/* Find character position for byte position in UTF-8 string */
+static size_t utf8_byte_to_char(const char *str, size_t byte_len, size_t byte_pos) {
+    if (byte_pos >= byte_len) return utf8_char_count(str, byte_len);
+    
+    size_t char_pos = 0;
+    size_t current_byte = 0;
+    
+    while (current_byte < byte_pos && current_byte < byte_len) {
+        size_t char_len = utf8_char_len((uint8_t)str[current_byte]);
+        if (char_len > byte_len - current_byte) break;
+        
+        /* If this character would extend beyond our target byte position, 
+           we're in the middle of a character */
+        if (current_byte + char_len > byte_pos) {
+            break;
+        }
+        
+        current_byte += char_len;
+        char_pos++;
+    }
+    
+    return char_pos;
+}
+
 size_t rope_byte_to_char(const rope_t *rope, size_t byte_pos) {
     if (!rope || byte_pos >= rope->byte_len) return rope ? rope->char_len : 0;
     
@@ -575,7 +609,8 @@ size_t rope_byte_to_char(const rope_t *rope, size_t byte_pos) {
     }
     
     if (node && node->is_leaf) {
-        size_t leaf_chars = utf8_char_count(node->leaf.data, byte_pos);
+        size_t leaf_chars = utf8_byte_to_char(node->leaf.data, 
+                                             node->leaf.byte_len, byte_pos);
         return char_offset + leaf_chars;
     }
     
@@ -862,6 +897,7 @@ rope_t *rope_insert_bytes(rope_t *rope, size_t byte_pos,
     return rope;
 }
 
+
 static rope_node_t *node_insert_bytes(rope_node_t *node, size_t byte_pos,
                                       const char *str, size_t len) {
     if (node->is_leaf) {
@@ -891,7 +927,7 @@ static rope_node_t *node_insert_bytes(rope_node_t *node, size_t byte_pos,
     } else {
         /* Navigate to correct subtree */
         if (byte_pos <= node->byte_weight) {
-            node->branch.left = node_insert_bytes(node->branch.left, 
+            node->branch.left = node_insert_bytes(node->branch.left,
                                                  byte_pos, str, len);
         } else {
             node->branch.right = node_insert_bytes(node->branch.right,

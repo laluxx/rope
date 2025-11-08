@@ -99,7 +99,7 @@ Real production ropes often implement COW semantics so undo/redo can share struc
 
 The iterator doesn't maintain a proper traversal stack - it recalculates position on each access. A real iterator would cache the path through the tree and update it incrementally. Current approach works but isn't optimal for sequential access.
 
-### No Rebalancing Heuristics  
+### No Rebalancing Heuristics
 
 We balance on every insert. Some implementations only rebalance when imbalance exceeds a threshold, or batch rebalancing during idle time. This would reduce overhead for bulk operations.
 
