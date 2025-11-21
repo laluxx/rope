@@ -37,13 +37,21 @@ extern "C" {
 /* Opaque rope handle */
 typedef struct rope rope_t;
 
-/* Rope iterator for traversal */
+/* Rope iterrator for traversal */
 typedef struct {
     const rope_t *rope;
     size_t byte_pos;
     size_t char_pos;
     void *internal;
 } rope_iter_t;
+
+typedef struct {
+    void *leaf;                  // Opaque leaf pointer
+    size_t char_offset_in_leaf;  // Character position within this leaf
+    size_t byte_offset_in_leaf;  // Byte position within this leaf
+    size_t leaf_start_char;      // Absolute char position where leaf starts
+    size_t leaf_start_byte;      // Absolute byte position where leaf starts
+} chunk_info_t;
 
 /* UTF-8 info structure */
 typedef struct {
@@ -99,6 +107,14 @@ bool rope_iter_prev_char(rope_iter_t *iter, uint32_t *codepoint);
 void rope_iter_seek_char(rope_iter_t *iter, size_t char_pos);
 void rope_iter_seek_byte(rope_iter_t *iter, size_t byte_pos);
 void rope_iter_destroy(rope_iter_t *iter);
+
+/* Chunk API */
+bool rope_chunk_at_char(const rope_t *rope, size_t char_pos, chunk_info_t *info);
+bool rope_prev_chunk(const rope_t *rope, chunk_info_t *current, chunk_info_t *prev);
+const char *rope_chunk_data(const chunk_info_t *info);
+size_t rope_chunk_byte_len(const chunk_info_t *info);
+size_t rope_chunk_char_len(const chunk_info_t *info);
+
 
 /* Line-based operations (newline-aware) */
 size_t rope_line_count(const rope_t *rope);
@@ -159,12 +175,16 @@ typedef struct rope_node {
     };
 } rope_node_t;
 
+
+
 struct rope {
     rope_node_t *root;
     size_t byte_len;
     size_t char_len;
     size_t newlines;
 };
+
+
 
 /* Node pool for reduced allocations */
 #define NODE_POOL_SIZE 512
@@ -1091,33 +1111,107 @@ bool rope_validate_utf8(const rope_t *rope) {
 
 
 /* ============================================================================
- * ITERATOR IMPLEMENTATION
+ * CHUNK-BASED IMPLEMENTATION
  * ========================================================================= */
 
+// Get the leaf (chunk) containing a character position
+// Returns the leaf node, and sets out_char_offset to the char position within the leaf
+// and out_byte_offset to the byte position within the leaf
 
+const char *rope_chunk_data(const chunk_info_t *info) {
+    if (!info || !info->leaf) return NULL;
+    rope_node_t *leaf = (rope_node_t*)info->leaf;  // Cast from void*
+    return leaf->is_leaf ? leaf->leaf.data : NULL;
+}
+
+size_t rope_chunk_byte_len(const chunk_info_t *info) {
+    if (!info || !info->leaf) return 0;
+    rope_node_t *leaf = (rope_node_t*)info->leaf;  // Cast from void*
+    return leaf->is_leaf ? leaf->leaf.byte_len : 0;
+}
+
+size_t rope_chunk_char_len(const chunk_info_t *info) {
+    if (!info || !info->leaf) return 0;
+    rope_node_t *leaf = (rope_node_t*)info->leaf;  // Cast from void*
+    return leaf->is_leaf ? leaf->leaf.char_len : 0;
+}
+
+bool rope_chunk_at_char(const rope_t *rope, size_t char_pos, chunk_info_t *info) {
+    if (!rope || !rope->root || !info) return false;
+    
+    if (char_pos > rope->char_len) {
+        char_pos = rope->char_len;
+    }
+    
+    rope_node_t *node = rope->root;
+    size_t char_offset = 0;
+    size_t byte_offset = 0;
+    
+    // Navigate to the leaf containing char_pos
+    while (node && !node->is_leaf) {
+        size_t left_chars = node->char_weight;
+        
+        if (char_pos < left_chars) {
+            // Go left
+            node = node->branch.left;
+        } else {
+            // Go right
+            char_offset += left_chars;
+            byte_offset += node->byte_weight;
+            char_pos -= left_chars;
+            node = node->branch.right;
+        }
+    }
+    
+    if (!node || !node->is_leaf) return false;
+    
+    info->leaf = (void*)node;  // Cast rope_node_t* to void*
+    info->leaf_start_char = char_offset;
+    info->leaf_start_byte = byte_offset;
+    
+    // Convert remaining char position to byte position within leaf
+    size_t byte_pos = 0;
+    size_t chars_counted = 0;
+    
+    while (chars_counted < char_pos && byte_pos < node->leaf.byte_len) {
+        size_t char_len = utf8_char_len((uint8_t)node->leaf.data[byte_pos]);
+        byte_pos += char_len;
+        chars_counted++;
+    }
+    
+    info->char_offset_in_leaf = chars_counted;
+    info->byte_offset_in_leaf = byte_pos;
+    
+    return true;
+}
+
+// Get the previous chunk (leaf) in the rope
+bool rope_prev_chunk(const rope_t *rope, chunk_info_t *current, chunk_info_t *prev) {
+    if (!rope || !current || !prev) return false;
+    if (current->leaf_start_char == 0) return false;  // Already at first chunk
+    
+    // Get the chunk at the position just before current chunk
+    return rope_chunk_at_char(rope, current->leaf_start_char - 1, prev);
+}
+
+
+/* ============================================================================
+ * ITERATOR IMPLEMENTATION
+ * ========================================================================= */
 
 typedef struct {
     rope_node_t *stack[128];
     int sp;
     rope_node_t *current_leaf;
-    size_t leaf_byte_pos;        // Current position in leaf
+    size_t leaf_byte_pos;        // Current position within leaf (0 to leaf.byte_len)
+    size_t leaf_start_byte;      // Absolute byte position where current leaf starts in rope
 } rope_iter_state_t;
 
-/* Helper: Find character boundary by scanning BACKWARD in UTF-8
- * This is O(1) because UTF-8 characters are at most 4 bytes
- * Returns the start of the character that ends at byte_pos
- */
+/* Helper: Find character boundary by scanning BACKWARD in UTF-8 */
 static inline size_t find_char_start_backward(const char *data, size_t byte_pos) {
     if (byte_pos == 0) return 0;
     
-    // Scan backward looking for a non-continuation byte
-    // UTF-8 continuation bytes: 10xxxxxx (0x80 to 0xBF)
-    // Start bytes: 0xxxxxxx, 110xxxxx, 1110xxxx, 11110xxx
-    
-    size_t pos = byte_pos;
-    
-    // Move back from current position
-    pos--;
+    size_t pos = byte_pos - 1;
     
     // Skip backwards over continuation bytes (10xxxxxx)
     // At most 3 continuation bytes in valid UTF-8
@@ -1131,75 +1225,41 @@ static inline size_t find_char_start_backward(const char *data, size_t byte_pos)
 }
 
 /* Helper: Find the leftmost (first) leaf from a given node */
-static rope_node_t *find_leftmost_leaf(rope_node_t *node, rope_node_t **stack, int *sp) {
+static rope_node_t *find_leftmost_leaf(rope_node_t *node, rope_node_t **stack, int *sp, size_t *leaf_start_byte, size_t byte_offset) {
     while (node && !node->is_leaf) {
         stack[(*sp)++] = node;
         node = node->branch.left;
+        // byte_offset stays the same when going left
     }
-    return node;
-}
-
-/* Helper: Find the rightmost (last) leaf from a given node */
-static rope_node_t *find_rightmost_leaf(rope_node_t *node, rope_node_t **stack, int *sp) {
-    while (node && !node->is_leaf) {
-        stack[(*sp)++] = node;
-        node = node->branch.right;
-    }
+    *leaf_start_byte = byte_offset;
     return node;
 }
 
 /* Helper: Navigate to next leaf in in-order traversal */
-static rope_node_t *next_leaf(rope_iter_state_t *state) {
+static rope_node_t *next_leaf(rope_iter_state_t *state, size_t *out_byte_offset) {
     if (state->sp == 0) {
         return NULL;
     }
     
-    rope_node_t *parent = state->stack[--state->sp];
+    // Pop parent
+    state->sp--;
+    rope_node_t *parent = state->stack[state->sp];
+    
+    // Calculate the offset where parent's left subtree ends
+    size_t parent_left_size = parent->byte_weight;
     
     if (parent->branch.right) {
-        return find_leftmost_leaf(parent->branch.right, state->stack, &state->sp);
+        // Go to right subtree
+        // The offset is current position + remaining bytes in parent's left coverage
+        size_t right_offset = state->leaf_start_byte + parent_left_size;
+        size_t leaf_start;
+        rope_node_t *leaf = find_leftmost_leaf(parent->branch.right, state->stack, &state->sp, &leaf_start, right_offset);
+        *out_byte_offset = leaf_start;
+        return leaf;
     }
     
-    return next_leaf(state);
-}
-
-/* Helper: Navigate to previous leaf */
-static rope_node_t *prev_leaf(rope_iter_state_t *state) {
-    if (state->sp == 0) {
-        return NULL;
-    }
-    
-    rope_node_t *parent = state->stack[--state->sp];
-    
-    if (parent->branch.left) {
-        return find_rightmost_leaf(parent->branch.left, state->stack, &state->sp);
-    }
-    
-    return prev_leaf(state);
-}
-
-/* Helper: Find the character before a given byte position in a leaf
- * Returns the start byte position of that character
- * Returns byte_pos if no previous character exists
- */
-static size_t find_prev_char_in_leaf(const char *data, size_t byte_len, size_t byte_pos) {
-    if (byte_pos == 0) return 0;
-    
-    size_t scan = 0;
-    size_t last_start = 0;
-    
-    while (scan < byte_pos && scan < byte_len) {
-        last_start = scan;
-        size_t char_len = utf8_char_len((uint8_t)data[scan]);
-        scan += char_len;
-        
-        // If we've reached or passed our target, last_start is what we want
-        if (scan >= byte_pos) {
-            return last_start;
-        }
-    }
-    
-    return last_start;
+    // No right child, continue up the stack
+    return next_leaf(state, out_byte_offset);
 }
 
 void rope_iter_init(rope_iter_t *iter, const rope_t *rope, size_t char_pos) {
@@ -1218,12 +1278,15 @@ void rope_iter_init(rope_iter_t *iter, const rope_t *rope, size_t char_pos) {
     size_t byte_offset = 0;
     size_t target_byte = iter->byte_pos;
     
+    // Navigate to the leaf containing the target byte position
     while (node && !node->is_leaf) {
-        state->stack[state->sp++] = node;
-        
         if (target_byte < node->byte_weight) {
+            // Going left - push node
+            state->stack[state->sp++] = node;
             node = node->branch.left;
+            // byte_offset unchanged
         } else {
+            // Going right - don't push, adjust offset and target
             byte_offset += node->byte_weight;
             target_byte -= node->byte_weight;
             node = node->branch.right;
@@ -1233,6 +1296,7 @@ void rope_iter_init(rope_iter_t *iter, const rope_t *rope, size_t char_pos) {
     if (node && node->is_leaf) {
         state->current_leaf = node;
         state->leaf_byte_pos = target_byte;
+        state->leaf_start_byte = byte_offset;
         iter->byte_pos = byte_offset + target_byte;
     }
 }
@@ -1249,13 +1313,15 @@ bool rope_iter_next_char(rope_iter_t *iter, uint32_t *codepoint) {
     
     // If at end of current leaf, move to next
     if (state->leaf_byte_pos >= leaf->leaf.byte_len) {
-        state->current_leaf = next_leaf(state);
-        state->leaf_byte_pos = 0;
+        size_t new_offset;
+        state->current_leaf = next_leaf(state, &new_offset);
         
         if (!state->current_leaf) {
             return false;
         }
         
+        state->leaf_start_byte = new_offset;
+        state->leaf_byte_pos = 0;
         leaf = state->current_leaf;
     }
     
@@ -1265,9 +1331,9 @@ bool rope_iter_next_char(rope_iter_t *iter, uint32_t *codepoint) {
                             leaf->leaf.byte_len - state->leaf_byte_pos,
                             &bytes_read);
     
-    // Advance position - O(1) operation
+    // Advance position
     state->leaf_byte_pos += bytes_read;
-    iter->byte_pos += bytes_read;
+    iter->byte_pos = state->leaf_start_byte + state->leaf_byte_pos;
     iter->char_pos++;
     
     return true;
@@ -1281,38 +1347,48 @@ bool rope_iter_prev_char(rope_iter_t *iter, uint32_t *codepoint) {
     rope_iter_state_t *state = (rope_iter_state_t *)iter->internal;
     if (!state) return false;
     
-    rope_node_t *leaf = state->current_leaf;
-    
-    // Case 1: At beginning of leaf - move to previous leaf
-    if (!leaf || state->leaf_byte_pos == 0) {
-        leaf = prev_leaf(state);
+    // If at start of current leaf (or no current leaf), get previous chunk
+    if (!state->current_leaf || state->leaf_byte_pos == 0) {
+        chunk_info_t current, prev;
         
-        if (!leaf || !leaf->is_leaf) {
+        // Get current position as a chunk
+        if (!rope_chunk_at_char(iter->rope, iter->char_pos, &current)) {
             return false;
         }
         
-        state->current_leaf = leaf;
-        state->leaf_byte_pos = leaf->leaf.byte_len;
+        // Get previous chunk
+        if (!rope_prev_chunk(iter->rope, &current, &prev)) {
+            return false;
+        }
+        
+        // Update state to point to end of previous chunk
+        state->current_leaf = (rope_node_t*)prev.leaf;
+        state->leaf_byte_pos = rope_chunk_byte_len(&prev);
+        state->leaf_start_byte = prev.leaf_start_byte;
+        
+        // Clear the stack since we jumped via chunks
+        state->sp = 0;
     }
     
-    // Case 2: Scan backward in current leaf to find character start
-    // This is O(1) because we only scan back at most 3 bytes (max UTF-8 continuation bytes)
+    // Now scan backward in current leaf to find character start
+    rope_node_t *leaf = state->current_leaf;
+    if (!leaf || !leaf->is_leaf) return false;
+    
     size_t char_start = find_char_start_backward(leaf->leaf.data, state->leaf_byte_pos);
     
     // Decode the character
     size_t bytes_read;
-    *codepoint = utf8_decode(leaf->leaf.data + char_start,
-                            leaf->leaf.byte_len - char_start,
-                            &bytes_read);
+    *codepoint = utf8_decode(
+        leaf->leaf.data + char_start,
+        leaf->leaf.byte_len - char_start,
+        &bytes_read
+    );
     
-    if (bytes_read == 0) {
-        return false;
-    }
+    if (bytes_read == 0) return false;
     
-    // Move backward - O(1) operation (just like forward!)
-    size_t bytes_moved = state->leaf_byte_pos - char_start;
+    // Move backward
     state->leaf_byte_pos = char_start;
-    iter->byte_pos -= bytes_moved;
+    iter->byte_pos = state->leaf_start_byte + state->leaf_byte_pos;
     iter->char_pos--;
     
     return true;
