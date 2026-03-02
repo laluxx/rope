@@ -95,10 +95,6 @@ For a 1MB document (~1M chars), log₂(1M) ≈ 20, so worst-case is ~20 node vis
 
 Real production ropes often implement COW semantics so undo/redo can share structure between document versions. We always create new nodes. Adding COW would require reference counting and careful handling of modification.
 
-### Simplified Iterator
-
-The iterator doesn't maintain a proper traversal stack - it recalculates position on each access. A real iterator would cache the path through the tree and update it incrementally. Current approach works but isn't optimal for sequential access.
-
 ### No Rebalancing Heuristics
 
 We balance on every insert. Some implementations only rebalance when imbalance exceeds a threshold, or batch rebalancing during idle time. This would reduce overhead for bulk operations.
@@ -156,16 +152,6 @@ Tune these macros before including:
 
 `ROPE_NODE_SIZE` affects cache behavior. Smaller = more nodes = worse locality. Larger = fewer nodes = more wasted space in partially-filled leaves. 1KB works well for typical L1 cache sizes.
 
-## Testing Recommendations
-
-Key test cases:
-- Insert/delete at boundaries (0, length, middle)
-- UTF-8 sequences (ASCII, 2-byte, 3-byte, 4-byte, invalid)
-- Splits that land mid-character (should never happen with correct APIs)
-- Large documents (>1M chars) to verify O(log n) behavior
-- Pathological editing patterns (many small inserts at document start)
-- Line operations near beginning, middle, end
-
 ## Known Issues
 
 1. **Iterator state lifetime** - Iterator holds raw pointer to rope. If rope is freed while iterator exists, undefined behavior. Consider making iterators hold a reference or document lifetime rules clearly.
@@ -179,7 +165,6 @@ Key test cases:
 ## Future Enhancements
 
 **Worth doing:**
-- Proper iterator with cached stack
 - COW semantics for undo/redo
 - Piece table integration for better sequential edit performance
 - Line start index for fast line-based access
